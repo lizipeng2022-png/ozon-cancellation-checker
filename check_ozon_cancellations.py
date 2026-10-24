@@ -7,7 +7,7 @@ RAW_CLIENT_ID = os.environ.get("OZON_CLIENT_ID", "")
 RAW_API_KEY = os.environ.get("OZON_API_KEY", "")
 
 CLIENT_ID = "".join([c for c in RAW_CLIENT_ID if ord(c) < 128]).strip()
-API_KEY = "".join([c for c in RAW_API_KEY if ord(c) < 128].strip())
+API_KEY = "".join([c for c in RAW_API_KEY if ord(c) < 128]).strip()
 
 BASE_URL = "https://api-seller.ozon.ru"
 
