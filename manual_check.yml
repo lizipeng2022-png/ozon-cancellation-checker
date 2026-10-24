@@ -1,16 +1,7 @@
 name: Manual Check Ozon Cancellations
 
 on:
-  workflow_dispatch:
-    inputs:
-      start_date:
-        description: '开始日期 (YYYY-MM-DD，如 2026-09-01)'
-        required: true
-        default: '2026-09-01'
-      end_date:
-        description: '结束日期 (YYYY-MM-DD，如 2026-10-01)'
-        required: true
-        default: '2026-10-01'
+  workflow_dispatch: # 去掉 inputs，点击即可秒级触发
 
 jobs:
   run-manual-checker:
@@ -33,7 +24,5 @@ jobs:
           OZON_CLIENT_ID: ${{ secrets.OZON_CLIENT_ID }}
           OZON_API_KEY: ${{ secrets.OZON_API_KEY }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
-          START_DATE: ${{ github.event.inputs.start_date }}
-          END_DATE: ${{ github.event.inputs.end_date }}
         run: |
           python check_ozon_cancellations.py
