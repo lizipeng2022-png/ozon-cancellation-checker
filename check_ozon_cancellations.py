@@ -6,6 +6,7 @@ import sys
 
 RAW_CLIENT_ID = os.environ.get("OZON_CLIENT_ID", "")
 RAW_API_KEY = os.environ.get("OZON_API_KEY", "")
+PUSHPLUS_TOKEN = (os.environ.get("PUSHPLUS_TOKEN") or "").strip()
 
 CLIENT_ID = "".join([c for c in RAW_CLIENT_ID if ord(c) < 128]).strip()
 API_KEY = "".join([c for c in RAW_API_KEY if ord(c) < 128]).strip()
@@ -18,27 +19,48 @@ headers = {
     "Content-Type": "application/json"
 }
 
-def scan_all_postings():
-    # 按照后台页面能明确看到大量订单的区间：2026-08-01 至 2026-08-26
-    since = "2026-08-01T00:00:00Z"
-    to = "2026-08-26T23:59:59Z"
+def is_client_or_seller(initiator_str):
+    """
+    判断取消过失方是否为 买家 或 卖家（支持中英俄文判断）
+    """
+    if not initiator_str:
+        return False
+    
+    init = str(initiator_str).lower().strip()
+    
+    # 排除买家
+    if any(k in init for k in ["клиент", "покупатель", "client", "buyer", "买家"]):
+        return True
+    
+    # 排除卖家自身
+    if any(k in init for k in ["продавец", "seller", "卖家"]):
+        return True
+        
+    return False
+
+def get_claimable_orders():
+    # 动态生成过去 150 天的范围
+    now = datetime.datetime.now(datetime.timezone.utc)
+    since = (now - datetime.timedelta(days=150)).strftime("%Y-%m-%dT00:00:00Z")
+    to = now.strftime("%Y-%m-%dT23:59:59Z")
 
     print("=" * 70)
-    print(f"【全量订单无状态扫描】进单时间范围: {since} 至 {to}")
-    print("【测试目的】去掉 status: cancelled，查看 API 返回的真实状态与取消信息")
+    print(f"当前执行时间 (UTC): {now.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"【动态回溯 150 天】查询范围: {since} 至 {to}")
+    print("【筛选规则】取消过失方 (cancellation_initiator) 非买家 且 非卖家")
     print("=" * 70)
 
     offset = 0
-    limit = 50
-    total_postings = []
+    limit = 100
+    matched_orders = []
 
     while True:
-        # 去掉 status 过滤条件，全量拉取
         payload = {
             "dir": "DESC",
             "filter": {
                 "since": since,
-                "to": to
+                "to": to,
+                "status": "cancelled"
             },
             "limit": limit,
             "offset": offset,
@@ -58,47 +80,218 @@ def scan_all_postings():
         if not postings:
             break
 
-        total_postings.extend(postings)
+        for item in postings:
+            cancellation = item.get("cancellation", {})
+            initiator = cancellation.get("cancellation_initiator") or ""
+            reason = cancellation.get("cancel_reason") or ""
+            
+            # 过滤掉买家与卖家
+            if is_client_or_seller(initiator):
+                continue
 
-        # 仅测试前 100 笔订单即可看到规律
-        if len(total_postings) >= 100 or not data.get("result", {}).get("has_next", False):
+            # 计算订单金额
+            amount = sum(float(p.get("price", 0)) for p in item.get("products", []))
+            currency = item.get("products", [{}])[0].get("currency_code", "USD")
+
+            matched_orders.append({
+                "posting_number": item.get("posting_number"),
+                "initiator": initiator if initiator else "未标注(非买家/卖家)",
+                "reason": reason,
+                "cancel_reason_id": cancellation.get("cancel_reason_id"),
+                "tracking_number": item.get("tracking_number"),
+                "in_process_at": item.get("in_process_at"),
+                "amount": f"{amount:.2f} {currency}"
+            })
+
+        if not data.get("result", {}).get("has_next", False):
             break
         offset += limit
 
-    print(f"\n【扫描统计】共成功拉取到 {len(total_postings)} 笔订单！\n")
+    # 打印排查结果
+    print(f"\n【筛查结果】过去 150 天共发现 {len(matched_orders)} 笔非买家/卖家责任的取消订单（可索赔）：\n")
+    for idx, o in enumerate(matched_orders, 1):
+        print(f"[{idx}] 货件号: {o['posting_number']}")
+        print(f"    - 取消过失方: {o['initiator']}")
+        print(f"    - 取消原因: {o['reason']} (ID: {o['cancel_reason_id']})")
+        print(f"    - 货件金额: {o['amount']}")
+        print(f"    - 运单号: {o['tracking_number']}")
+        print(f"    - 进单时间: {o['in_process_at']}\n")
 
-    if not total_postings:
-        print("依然拉取到 0 笔订单。请检查 Client-Id/Api-Key 是否对应当前查看的店铺。")
-        return
-
-    # 统计所有订单的状态分布
-    status_summary = {}
-    cancelled_orders = []
-
-    for item in total_postings:
-        st = item.get("status")
-        status_summary[st] = status_summary.get(st, 0) + 1
-        
-        # 只要带有 cancellation 或者是 cancelled 状态就记录
-        if st == "cancelled" or item.get("cancellation"):
-            cancelled_orders.append(item)
-
-    print("=" * 70)
-    print("【当前拉取到的所有订单状态分布统计】:")
-    for st, count in status_summary.items():
-        print(f"  * 状态 [{st}]: {count} 笔")
-    print("=" * 70)
-
-    print(f"\n【其中已取消或含取消信息的订单共有 {len(cancelled_orders)} 笔】：\n")
-    for idx, item in enumerate(cancelled_orders, 1):
-        cancellation = item.get("cancellation", {})
-        print(f"[{idx}] 货件号: {item.get('posting_number')} (状态: {item.get('status')})")
-        print(f"    - 取消过失方 (cancellation_initiator): 【{cancellation.get('cancellation_initiator')}】")
-        print(f"    - 取消原因 (cancel_reason): 【{cancellation.get('cancel_reason')}】 (ID: {cancellation.get('cancel_reason_id')})")
-        print(f"    - 取消类型 (cancellation_type): {cancellation.get('cancellation_type')}")
-        print(f"    - 原始 cancellation 节点: {cancellation}\n")
+    # 推送微信通知（若配置了 PushPlus）
+    if PUSHPLUS_TOKEN and matched_orders:
+        push_lines = [f"### 【Ozon 索赔提醒】发现 {len(matched_orders)} 笔非买/卖家责任订单\n"]
+        for o in matched_orders:
+            push_lines.append(
+                f"- **货件号**: `{o['posting_number']}`\n"
+                f"  - 过失方: `{o['initiator']}`\n"
+                f"  - 原因: {o['reason']}\n"
+                f"  - 金额: {o['amount']}\n"
+                f"  - 运单号: `{o['tracking_number']}`\n"
+            )
+        try:
+            requests.post(
+                "http://www.pushplus.plus/send",
+                json={
+                    "token": PUSHPLUS_TOKEN,
+                    "title": f"【Ozon索赔】{len(matched_orders)} 笔责任取消订单待处理",
+                    "content": "\n".join(push_lines),
+                    "template": "markdown"
+                },
+                timeout=10
+            )
+            print("PushPlus 微信通知已成功送达！")
+        except Exception as e:
+            print(f"PushPlus 推送异常: {e}")
 
 if __name__ == "__main__":
     if not CLIENT_ID or not API_KEY:
         raise ValueError("请检查 OZON_CLIENT_ID 和 OZON_API_KEY！")
-    scan_all_postings()
+    get_claimable_orders()import os
+import requests
+import datetime
+import json
+import sys
+
+RAW_CLIENT_ID = os.environ.get("OZON_CLIENT_ID", "")
+RAW_API_KEY = os.environ.get("OZON_API_KEY", "")
+PUSHPLUS_TOKEN = (os.environ.get("PUSHPLUS_TOKEN") or "").strip()
+
+CLIENT_ID = "".join([c for c in RAW_CLIENT_ID if ord(c) < 128]).strip()
+API_KEY = "".join([c for c in RAW_API_KEY if ord(c) < 128]).strip()
+
+BASE_URL = "https://api-seller.ozon.ru"
+
+headers = {
+    "Client-Id": CLIENT_ID,
+    "Api-Key": API_KEY,
+    "Content-Type": "application/json"
+}
+
+def is_client_or_seller(initiator_str):
+    """
+    判断取消过失方是否为 买家 或 卖家（支持中英俄文判断）
+    """
+    if not initiator_str:
+        return False
+    
+    init = str(initiator_str).lower().strip()
+    
+    # 排除买家
+    if any(k in init for k in ["клиент", "покупатель", "client", "buyer", "买家"]):
+        return True
+    
+    # 排除卖家自身
+    if any(k in init for k in ["продавец", "seller", "卖家"]):
+        return True
+        
+    return False
+
+def get_claimable_orders():
+    # 动态生成过去 150 天的范围
+    now = datetime.datetime.now(datetime.timezone.utc)
+    since = (now - datetime.timedelta(days=150)).strftime("%Y-%m-%dT00:00:00Z")
+    to = now.strftime("%Y-%m-%dT23:59:59Z")
+
+    print("=" * 70)
+    print(f"当前执行时间 (UTC): {now.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"【动态回溯 150 天】查询范围: {since} 至 {to}")
+    print("【筛选规则】取消过失方 (cancellation_initiator) 非买家 且 非卖家")
+    print("=" * 70)
+
+    offset = 0
+    limit = 100
+    matched_orders = []
+
+    while True:
+        payload = {
+            "dir": "DESC",
+            "filter": {
+                "since": since,
+                "to": to,
+                "status": "cancelled"
+            },
+            "limit": limit,
+            "offset": offset,
+            "with": {
+                "analytics_data": True,
+                "financial_data": True
+            }
+        }
+
+        resp = requests.post(f"{BASE_URL}/v4/posting/fbs/list", headers=headers, json=payload, timeout=30)
+        if resp.status_code != 200:
+            print(f"Ozon API 请求失败: {resp.status_code}, {resp.text}")
+            sys.exit(1)
+
+        data = resp.json()
+        postings = data.get("result", {}).get("postings", [])
+        if not postings:
+            break
+
+        for item in postings:
+            cancellation = item.get("cancellation", {})
+            initiator = cancellation.get("cancellation_initiator") or ""
+            reason = cancellation.get("cancel_reason") or ""
+            
+            # 过滤掉买家与卖家
+            if is_client_or_seller(initiator):
+                continue
+
+            # 计算订单金额
+            amount = sum(float(p.get("price", 0)) for p in item.get("products", []))
+            currency = item.get("products", [{}])[0].get("currency_code", "USD")
+
+            matched_orders.append({
+                "posting_number": item.get("posting_number"),
+                "initiator": initiator if initiator else "未标注(非买家/卖家)",
+                "reason": reason,
+                "cancel_reason_id": cancellation.get("cancel_reason_id"),
+                "tracking_number": item.get("tracking_number"),
+                "in_process_at": item.get("in_process_at"),
+                "amount": f"{amount:.2f} {currency}"
+            })
+
+        if not data.get("result", {}).get("has_next", False):
+            break
+        offset += limit
+
+    # 打印排查结果
+    print(f"\n【筛查结果】过去 150 天共发现 {len(matched_orders)} 笔非买家/卖家责任的取消订单（可索赔）：\n")
+    for idx, o in enumerate(matched_orders, 1):
+        print(f"[{idx}] 货件号: {o['posting_number']}")
+        print(f"    - 取消过失方: {o['initiator']}")
+        print(f"    - 取消原因: {o['reason']} (ID: {o['cancel_reason_id']})")
+        print(f"    - 货件金额: {o['amount']}")
+        print(f"    - 运单号: {o['tracking_number']}")
+        print(f"    - 进单时间: {o['in_process_at']}\n")
+
+    # 推送微信通知（若配置了 PushPlus）
+    if PUSHPLUS_TOKEN and matched_orders:
+        push_lines = [f"### 【Ozon 索赔提醒】发现 {len(matched_orders)} 笔非买/卖家责任订单\n"]
+        for o in matched_orders:
+            push_lines.append(
+                f"- **货件号**: `{o['posting_number']}`\n"
+                f"  - 过失方: `{o['initiator']}`\n"
+                f"  - 原因: {o['reason']}\n"
+                f"  - 金额: {o['amount']}\n"
+                f"  - 运单号: `{o['tracking_number']}`\n"
+            )
+        try:
+            requests.post(
+                "http://www.pushplus.plus/send",
+                json={
+                    "token": PUSHPLUS_TOKEN,
+                    "title": f"【Ozon索赔】{len(matched_orders)} 笔责任取消订单待处理",
+                    "content": "\n".join(push_lines),
+                    "template": "markdown"
+                },
+                timeout=10
+            )
+            print("PushPlus 微信通知已成功送达！")
+        except Exception as e:
+            print(f"PushPlus 推送异常: {e}")
+
+if __name__ == "__main__":
+    if not CLIENT_ID or not API_KEY:
+        raise ValueError("请检查 OZON_CLIENT_ID 和 OZON_API_KEY！")
+    get_claimable_orders()
