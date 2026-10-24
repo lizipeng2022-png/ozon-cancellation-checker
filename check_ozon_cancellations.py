@@ -12,7 +12,7 @@ PUSHPLUS_TOKEN = (os.environ.get("PUSHPLUS_TOKEN") or "").strip()
 INPUT_SINCE = os.environ.get("START_DATE")
 INPUT_TO = os.environ.get("END_DATE")
 
-# 强制过滤非 ASCII 字符与不可见空白，彻底解决 latin-1 编码报错
+# 清洗凭据
 CLIENT_ID = "".join([c for c in RAW_CLIENT_ID if ord(c) < 128]).strip()
 API_KEY = "".join([c for c in RAW_API_KEY if ord(c) < 128]).strip()
 
@@ -35,7 +35,8 @@ def get_cancelled_postings():
 
     print(f"正在查询时间范围: {since} 至 {to}")
 
-    url = f"{BASE_URL}/v3/posting/fbs/list"
+    # 使用 Ozon 最新的 v4 接口
+    url = f"{BASE_URL}/v4/posting/fbs/list"
     headers = {
         "Client-Id": CLIENT_ID,
         "Api-Key": API_KEY,
