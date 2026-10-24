@@ -47,7 +47,6 @@ def safe_post(url, json_data, max_attempts=3):
 def is_client_or_seller(initiator_str):
     """
     判断取消过失方是否为买家或卖家
-    若未填写过失方（None 或空字符串），返回 False（保留输出给人工甄别）
     """
     if not initiator_str:
         return False
@@ -64,7 +63,8 @@ def filter_claimable_orders():
     print("=" * 80)
     print(f"当前运行时间 (UTC): {now.strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"【索赔/待甄别订单筛查】正在扫描过去 {TOTAL_DAYS} 天内所有已取消订单")
-    print("【过滤规则】排除 'Клиент'(买家) 与 'Продавец'(卖家)；保留物流/官方/未填写的订单")
+    print("【过滤规则】1. 必须是已取消订单(status == 'cancelled')")
+    print("            2. 排除 'Клиент'(买家) 与 'Продавец'(卖家)；保留物流/官方/未填写的订单")
     print("=" * 80)
 
     matched_orders = {}
@@ -108,7 +108,11 @@ def filter_claimable_orders():
 
             new_count = 0
             for item in postings:
-                posting_num = item.get("posting_number")
+                # 防线 1: 必须是 status == "cancelled"
+                status = item.get("status")
+                if status != "cancelled":
+                    continue
+
                 cancellation = item.get("cancellation", {})
                 initiator = cancellation.get("cancellation_initiator")
                 reason = cancellation.get("cancel_reason")
@@ -116,15 +120,16 @@ def filter_claimable_orders():
 
                 total_cancelled_scanned += 1
 
-                # 排除买家与卖家责任
+                # 防线 2: 排除买家与卖家责任
                 if is_client_or_seller(initiator):
                     continue
 
+                posting_num = item.get("posting_number")
                 if posting_num not in matched_orders:
                     new_count += 1
                     matched_orders[posting_num] = {
                         "posting_number": posting_num,
-                        "status": item.get("status"),
+                        "status": status,
                         "initiator": initiator if initiator else "未填写(需人工甄别)",
                         "reason": reason if reason else "未填写",
                         "reason_id": reason_id,
@@ -141,8 +146,8 @@ def filter_claimable_orders():
             page += 1
 
     print("\n" + "=" * 80)
-    print(f"【扫描汇总】共扫描已取消订单 {total_cancelled_scanned} 笔")
-    print(f"【筛选结果】排除买家/卖家后，共提取出 {len(matched_orders)} 笔待处理/可索赔订单：")
+    print(f"【扫描汇总】共扫描真实已取消订单 (status=cancelled): {total_cancelled_scanned} 笔")
+    print(f"【筛选结果】排除买家/卖家后，真正可索赔/需甄别订单共: {len(matched_orders)} 笔")
     print("=" * 80 + "\n")
 
     for idx, o in enumerate(matched_orders.values(), 1):
@@ -155,9 +160,8 @@ def filter_claimable_orders():
     if PUSHPLUS_TOKEN and matched_orders:
         push_lines = [
             f"### 【Ozon 索赔/待甄别清单】共 {len(matched_orders)} 笔订单\n",
-            "> 筛选规则：排除买家与卖家责任，保留物流/平台及未填写过失方的订单\n"
+            "> 筛选规则：真实取消(cancelled) + 排除买家与卖家责任\n"
         ]
-        # 控制推送单量避免微信消息过长截断（前 30 笔详细输出，超出部分提示查看日志）
         for o in list(matched_orders.values())[:30]:
             push_lines.append(
                 f"- **货件号**: `{o['posting_number']}`\n"
