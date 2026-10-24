@@ -7,7 +7,6 @@ import sys
 # 从环境变量中读取
 RAW_CLIENT_ID = os.environ.get("OZON_CLIENT_ID", "")
 RAW_API_KEY = os.environ.get("OZON_API_KEY", "")
-PUSHPLUS_TOKEN = (os.environ.get("PUSHPLUS_TOKEN") or "").strip()
 
 INPUT_SINCE = os.environ.get("START_DATE")
 INPUT_TO = os.environ.get("END_DATE")
@@ -25,7 +24,7 @@ def format_rfc3339(date_str, is_end=False):
     time_suffix = "23:59:59Z" if is_end else "00:00:00Z"
     return f"{date_str.strip()}T{time_suffix}"
 
-def get_cancelled_postings():
+def dump_all_cancelled_postings():
     now = datetime.datetime.now(datetime.timezone.utc)
     default_since = (now - datetime.timedelta(days=30)).strftime("%Y-%m-%dT00:00:00Z")
     default_to = now.strftime("%Y-%m-%dT23:59:59Z")
@@ -33,9 +32,10 @@ def get_cancelled_postings():
     since = format_rfc3339(INPUT_SINCE, False) or default_since
     to = format_rfc3339(INPUT_TO, True) or default_to
 
-    print(f"正在查询时间范围: {since} 至 {to}")
+    print("=" * 60)
+    print(f"【开始拉取全量取消订单】时间范围: {since} 至 {to}")
+    print("=" * 60)
 
-    # 使用 Ozon 最新的 v4 接口
     url = f"{BASE_URL}/v4/posting/fbs/list"
     headers = {
         "Client-Id": CLIENT_ID,
@@ -43,11 +43,9 @@ def get_cancelled_postings():
         "Content-Type": "application/json"
     }
 
-    claimable_orders = []
     offset = 0
     limit = 100
-
-    LOGISTIC_KEYWORDS = ["доставка", "перевозчик", "утеря", "потер", "поврежд", "lost", "damage"]
+    total_postings = []
 
     while True:
         payload = {
@@ -60,7 +58,7 @@ def get_cancelled_postings():
             "limit": limit,
             "offset": offset,
             "with": {
-                "analytics_data": False,
+                "analytics_data": True,
                 "financial_data": True
             }
         }
@@ -77,68 +75,38 @@ def get_cancelled_postings():
         if not postings:
             break
 
-        for item in postings:
-            cancellation = item.get("cancellation", {})
-            initiator = (cancellation.get("cancellation_initiator") or "").lower()
-            reason = cancellation.get("cancel_reason") or ""
-            reason_lower = reason.lower()
-
-            is_ozon_fault = False
-            if initiator in ["ozon", "delivery", "logistic"]:
-                is_ozon_fault = True
-            elif any(kw in reason_lower for kw in LOGISTIC_KEYWORDS):
-                is_ozon_fault = True
-
-            if is_ozon_fault:
-                claimable_orders.append({
-                    "posting_number": item.get("posting_number"),
-                    "cancel_reason": reason,
-                    "initiator": initiator,
-                    "cancel_date": cancellation.get("cancellation_after_analytics"),
-                    "tracking_number": item.get("tracking_number"),
-                    "price_total": sum(float(p.get("price", 0)) for p in item.get("products", []))
-                })
+        total_postings.extend(postings)
 
         if not data.get("result", {}).get("has_next", False):
             break
         offset += limit
 
-    return claimable_orders, since, to
+    print(f"\n查询完成！该时间段内共获取到 {len(total_postings)} 笔取消订单。\n")
 
-def notify(orders, since, to):
-    if not orders:
-        print(f"\n[{since[:10]} ~ {to[:10]}] 时间段内未发现 Ozon/物流责任的取消订单。")
+    if not total_postings:
+        print("未查询到任何已取消订单。如果该时间段确实有订单被取消，请确认后台订单创建时间是否在该范围内。")
         return
 
-    content_lines = [f"### 【Ozon索赔提醒】发现 {len(orders)} 笔责任取消订单\n"]
-    content_lines.append(f"**查询周期**: `{since[:10]}` 至 `{to[:10]}`\n")
-    for o in orders:
-        line = (
-            f"- **货件号**: `{o['posting_number']}`\n"
-            f"  - 原因: {o['cancel_reason']} (发起方: {o['initiator']})\n"
-            f"  - 金额: {o['price_total']}\n"
-            f"  - 运单号: `{o['tracking_number']}`\n"
-        )
-        content_lines.append(line)
+    # 1. 打印第一个订单的完整 JSON 报文样本，供结构分析
+    print("=" * 60)
+    print("【样本订单完整 JSON 报文结构】:")
+    print(json.dumps(total_postings[0], indent=2, ensure_ascii=False))
+    print("=" * 60)
 
-    markdown_body = "\n".join(content_lines)
-    print("\n" + markdown_body)
-
-    if PUSHPLUS_TOKEN:
-        push_url = "http://www.pushplus.plus/send"
-        payload = {
-            "token": PUSHPLUS_TOKEN,
-            "title": f"【Ozon索赔】{len(orders)}笔订单可申请赔偿",
-            "content": markdown_body,
-            "template": "markdown"
-        }
-        try:
-            requests.post(push_url, json=payload, timeout=10)
-        except Exception as e:
-            print(f"PushPlus 推送异常: {e}")
+    # 2. 依次输出每一笔取消订单的核心责任关键字段
+    print("\n【所有取消订单明细清单】:")
+    for idx, item in enumerate(total_postings, 1):
+        cancellation = item.get("cancellation", {})
+        print(f"\n[{idx}] 货件号: {item.get('posting_number')}")
+        print(f"    - 发起方 (cancellation_initiator): {cancellation.get('cancellation_initiator')}")
+        print(f"    - 取消原因 (cancel_reason): {cancellation.get('cancel_reason')}")
+        print(f"    - 取消原因 ID (cancel_reason_id): {cancellation.get('cancel_reason_id')}")
+        print(f"    - 取消类型 (cancellation_type): {cancellation.get('cancellation_type')}")
+        print(f"    - 运单号 (tracking_number): {item.get('tracking_number')}")
+        print(f"    - 货件当前状态 (status): {item.get('status')}")
+        print(f"    - 取消详情节点 (cancellation raw): {cancellation}")
 
 if __name__ == "__main__":
     if not CLIENT_ID or not API_KEY:
         raise ValueError("请检查 OZON_CLIENT_ID 和 OZON_API_KEY 环境变量！")
-    orders, s, t = get_cancelled_postings()
-    notify(orders, s, t)
+    dump_all_cancelled_postings()
