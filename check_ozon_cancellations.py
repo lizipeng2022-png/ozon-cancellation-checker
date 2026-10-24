@@ -1,6 +1,9 @@
 import os
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util import Retry
 import datetime
+import time
 import sys
 
 RAW_CLIENT_ID = os.environ.get("OZON_CLIENT_ID", "")
@@ -16,6 +19,29 @@ headers = {
     "Api-Key": API_KEY,
     "Content-Type": "application/json"
 }
+
+# 创建带自动重试机制的 Session，彻底解决偶发超时与握手断连问题
+session = requests.Session()
+retries = Retry(
+    total=3,
+    backoff_factor=2,
+    status_forcelist=[500, 502, 503, 504],
+    raise_on_status=False
+)
+adapter = HTTPAdapter(max_retries=retries)
+session.mount("https://", adapter)
+session.mount("http://", adapter)
+
+def safe_post(url, json_data, max_attempts=3):
+    """带网络超时重试的 POST 函数"""
+    for attempt in range(1, max_attempts + 1):
+        try:
+            resp = session.post(url, headers=headers, json=json_data, timeout=60)
+            return resp
+        except (requests.exceptions.ReadTimeout, requests.exceptions.ConnectionError) as e:
+            print(f"  [网络提示] 连接 Ozon 出现超时 ({e.__class__.__name__})，正在进行第 {attempt}/{max_attempts} 次自动重试...")
+            time.sleep(3)
+    return None
 
 def dump_all_cancellation_details():
     now = datetime.datetime.now(datetime.timezone.utc)
@@ -55,9 +81,11 @@ def dump_all_cancellation_details():
             if cursor:
                 payload["cursor"] = cursor
 
-            resp = requests.post(f"{BASE_URL}/v4/posting/fbs/list", headers=headers, json=payload, timeout=30)
-            if resp.status_code != 200:
-                print(f"区间 {since_str[:10]}~{to_str[:10]} 请求异常 ({resp.status_code}): {resp.text}")
+            resp = safe_post(f"{BASE_URL}/v4/posting/fbs/list", payload)
+            if resp is None or resp.status_code != 200:
+                status_info = resp.status_code if resp else "超时无响应"
+                text_info = resp.text if resp else ""
+                print(f"区间 {since_str[:10]}~{to_str[:10]} 请求异常 ({status_info}): {text_info}")
                 break
 
             data = resp.json()
