@@ -4,36 +4,40 @@ import datetime
 import json
 import sys
 
-# 从环境变量中读取
 RAW_CLIENT_ID = os.environ.get("OZON_CLIENT_ID", "")
 RAW_API_KEY = os.environ.get("OZON_API_KEY", "")
 
-INPUT_SINCE = os.environ.get("START_DATE")
-INPUT_TO = os.environ.get("END_DATE")
-
-# 清洗凭据
 CLIENT_ID = "".join([c for c in RAW_CLIENT_ID if ord(c) < 128]).strip()
 API_KEY = "".join([c for c in RAW_API_KEY if ord(c) < 128]).strip()
 
 BASE_DOMAIN = "api-seller" + ".ozon.ru"
 BASE_URL = f"https://{BASE_DOMAIN}"
 
-def format_rfc3339(date_str, is_end=False):
-    if not date_str:
+def parse_iso_time(time_str):
+    """解析 RFC3339 / ISO 时间字符串为 UTC datetime"""
+    if not time_str:
         return None
-    time_suffix = "23:59:59Z" if is_end else "00:00:00Z"
-    return f"{date_str.strip()}T{time_suffix}"
+    time_str = time_str.replace("Z", "+00:00")
+    try:
+        return datetime.datetime.fromisoformat(time_str)
+    except Exception:
+        return None
 
-def dump_all_cancelled_postings():
+def get_claimable_orders():
     now = datetime.datetime.now(datetime.timezone.utc)
-    default_since = (now - datetime.timedelta(days=30)).strftime("%Y-%m-%dT00:00:00Z")
-    default_to = now.strftime("%Y-%m-%dT23:59:59Z")
+    
+    # 索赔合格区间：取消距今 60 ~ 90 天
+    target_cancel_end = now - datetime.timedelta(days=60)
+    target_cancel_start = now - datetime.timedelta(days=90)
 
-    since = format_rfc3339(INPUT_SINCE, False) or default_since
-    to = format_rfc3339(INPUT_TO, True) or default_to
+    # 为了确保不漏掉这批订单，API 拉取过去 150 天内的订单
+    api_since = (now - datetime.timedelta(days=150)).strftime("%Y-%m-%dT00:00:00Z")
+    api_to = now.strftime("%Y-%m-%dT23:59:59Z")
 
     print("=" * 60)
-    print(f"【开始拉取全量取消订单】时间范围: {since} 至 {to}")
+    print(f"当前时间 (UTC): {now.strftime('%Y-%m-%d %H:%M:%S')}")
+    print(f"【目标取消日期区间】: {target_cancel_start.strftime('%Y-%m-%d')} 至 {target_cancel_end.strftime('%Y-%m-%d')} (满60天且<90天)")
+    print(f"【API拉取订单生成周期】: {api_since[:10]} 至 {api_to[:10]}")
     print("=" * 60)
 
     url = f"{BASE_URL}/v4/posting/fbs/list"
@@ -45,14 +49,18 @@ def dump_all_cancelled_postings():
 
     offset = 0
     limit = 100
-    total_postings = []
+    matched_orders = []
+
+    # 官方/承运商责任关键词
+    LOGISTIC_KEYWORDS = ["доставка", "перевозчик", "утеря", "потер", "поврежд", "lost", "damage"]
+    CLIENT_KEYWORDS = ["клиент", "покупатель", "передумал", "не подош", "client", "buyer"]
 
     while True:
         payload = {
             "dir": "DESC",
             "filter": {
-                "since": since,
-                "to": to,
+                "since": api_since,
+                "to": api_to,
                 "status": "cancelled"
             },
             "limit": limit,
@@ -64,10 +72,8 @@ def dump_all_cancelled_postings():
         }
 
         resp = requests.post(url, headers=headers, json=payload, timeout=30)
-        
         if resp.status_code != 200:
-            print(f"Ozon API 请求失败，状态码: {resp.status_code}")
-            print(f"错误响应: {resp.text}")
+            print(f"Ozon API 请求失败: {resp.status_code}, {resp.text}")
             sys.exit(1)
 
         data = resp.json()
@@ -75,38 +81,61 @@ def dump_all_cancelled_postings():
         if not postings:
             break
 
-        total_postings.extend(postings)
+        for item in postings:
+            cancellation = item.get("cancellation", {})
+            initiator = (cancellation.get("cancellation_initiator") or "").lower().strip()
+            reason = cancellation.get("cancel_reason") or ""
+            reason_lower = reason.lower().strip()
+
+            # 1. 提取取消时间 (以 cancellation 节点或 analytics 为准)
+            cancel_time_str = cancellation.get("cancellation_after_analytics") or item.get("in_process_at")
+            cancel_time = parse_iso_time(cancel_time_str)
+
+            if not cancel_time:
+                continue
+
+            # 2. 判断取消时间是否落在 60 ~ 90 天窗口内
+            days_since_cancel = (now - cancel_time).days
+            if not (60 <= days_since_cancel <= 90):
+                continue
+
+            # 3. 责任方判断：排除买家/卖家责任
+            if initiator in CLIENT_KEYWORDS or any(kw in reason_lower for kw in CLIENT_KEYWORDS):
+                continue
+            if initiator == "seller":
+                continue
+
+            # 判断是否符合 Ozon 赔付
+            is_ozon_fault = False
+            if initiator in ["ozon", "delivery", "logistic", "carrier"]:
+                is_ozon_fault = True
+            elif any(kw in reason_lower for kw in LOGISTIC_KEYWORDS):
+                is_ozon_fault = True
+
+            if is_ozon_fault:
+                matched_orders.append({
+                    "posting_number": item.get("posting_number"),
+                    "cancel_date": cancel_time.strftime("%Y-%m-%d %H:%M"),
+                    "days_ago": days_since_cancel,
+                    "reason": reason,
+                    "initiator": initiator,
+                    "tracking_number": item.get("tracking_number"),
+                    "amount": sum(float(p.get("price", 0)) for p in item.get("products", []))
+                })
 
         if not data.get("result", {}).get("has_next", False):
             break
         offset += limit
 
-    print(f"\n查询完成！该时间段内共获取到 {len(total_postings)} 笔取消订单。\n")
-
-    if not total_postings:
-        print("未查询到任何已取消订单。如果该时间段确实有订单被取消，请确认后台订单创建时间是否在该范围内。")
-        return
-
-    # 1. 打印第一个订单的完整 JSON 报文样本，供结构分析
-    print("=" * 60)
-    print("【样本订单完整 JSON 报文结构】:")
-    print(json.dumps(total_postings[0], indent=2, ensure_ascii=False))
-    print("=" * 60)
-
-    # 2. 依次输出每一笔取消订单的核心责任关键字段
-    print("\n【所有取消订单明细清单】:")
-    for idx, item in enumerate(total_postings, 1):
-        cancellation = item.get("cancellation", {})
-        print(f"\n[{idx}] 货件号: {item.get('posting_number')}")
-        print(f"    - 发起方 (cancellation_initiator): {cancellation.get('cancellation_initiator')}")
-        print(f"    - 取消原因 (cancel_reason): {cancellation.get('cancel_reason')}")
-        print(f"    - 取消原因 ID (cancel_reason_id): {cancellation.get('cancel_reason_id')}")
-        print(f"    - 取消类型 (cancellation_type): {cancellation.get('cancellation_type')}")
-        print(f"    - 运单号 (tracking_number): {item.get('tracking_number')}")
-        print(f"    - 货件当前状态 (status): {item.get('status')}")
-        print(f"    - 取消详情节点 (cancellation raw): {cancellation}")
+    # 输出结果
+    print(f"\n【筛查结果】共发现 {len(matched_orders)} 笔符合“取消满60天且未满90天”的 Ozon 责任订单：\n")
+    for o in matched_orders:
+        print(f"▶ 货件号: {o['posting_number']}")
+        print(f"  - 取消时间: {o['cancel_date']} (已取消 {o['days_ago']} 天)")
+        print(f"  - 取消原因: {o['reason']} [发起方: {o['initiator']}]")
+        print(f"  - 货件金额: {o['amount']} | 运单号: {o['tracking_number']}\n")
 
 if __name__ == "__main__":
     if not CLIENT_ID or not API_KEY:
-        raise ValueError("请检查 OZON_CLIENT_ID 和 OZON_API_KEY 环境变量！")
-    dump_all_cancelled_postings()
+        raise ValueError("请检查 OZON_CLIENT_ID 和 OZON_API_KEY！")
+    get_claimable_orders()
