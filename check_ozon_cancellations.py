@@ -2,15 +2,22 @@ import os
 import requests
 import datetime
 import json
+import sys
 
-CLIENT_ID = os.environ.get("OZON_CLIENT_ID")
-API_KEY = os.environ.get("OZON_API_KEY")
-PUSHPLUS_TOKEN = os.environ.get("PUSHPLUS_TOKEN")
+# 从环境变量中读取
+RAW_CLIENT_ID = os.environ.get("OZON_CLIENT_ID", "")
+RAW_API_KEY = os.environ.get("OZON_API_KEY", "")
+PUSHPLUS_TOKEN = (os.environ.get("PUSHPLUS_TOKEN") or "").strip()
 
 INPUT_SINCE = os.environ.get("START_DATE")
 INPUT_TO = os.environ.get("END_DATE")
 
-BASE_URL = "https://api-seller.ozon.ru"
+# 强制过滤非 ASCII 字符与不可见空白，彻底解决 latin-1 编码报错
+CLIENT_ID = "".join([c for c in RAW_CLIENT_ID if ord(c) < 128]).strip()
+API_KEY = "".join([c for c in RAW_API_KEY if ord(c) < 128]).strip()
+
+BASE_DOMAIN = "api-seller" + ".ozon.ru"
+BASE_URL = f"https://{BASE_DOMAIN}"
 
 def format_rfc3339(date_str, is_end=False):
     if not date_str:
@@ -58,8 +65,13 @@ def get_cancelled_postings():
         }
 
         resp = requests.post(url, headers=headers, json=payload, timeout=30)
-        data = resp.json()
+        
+        if resp.status_code != 200:
+            print(f"Ozon API 请求失败，状态码: {resp.status_code}")
+            print(f"错误响应: {resp.text}")
+            sys.exit(1)
 
+        data = resp.json()
         postings = data.get("result", {}).get("postings", [])
         if not postings:
             break
@@ -94,7 +106,7 @@ def get_cancelled_postings():
 
 def notify(orders, since, to):
     if not orders:
-        print(f"\n[{since} ~ {to}] 时间段内未发现 Ozon/物流责任的取消订单。")
+        print(f"\n[{since[:10]} ~ {to[:10]}] 时间段内未发现 Ozon/物流责任的取消订单。")
         return
 
     content_lines = [f"### 【Ozon索赔提醒】发现 {len(orders)} 笔责任取消订单\n"]
@@ -119,10 +131,13 @@ def notify(orders, since, to):
             "content": markdown_body,
             "template": "markdown"
         }
-        requests.post(push_url, json=payload, timeout=10)
+        try:
+            requests.post(push_url, json=payload, timeout=10)
+        except Exception as e:
+            print(f"PushPlus 推送异常: {e}")
 
 if __name__ == "__main__":
     if not CLIENT_ID or not API_KEY:
-        raise ValueError("请配置 OZON_CLIENT_ID 和 OZON_API_KEY 环境变量！")
+        raise ValueError("请检查 OZON_CLIENT_ID 和 OZON_API_KEY 环境变量！")
     orders, s, t = get_cancelled_postings()
     notify(orders, s, t)
