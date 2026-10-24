@@ -6,6 +6,7 @@ import sys
 
 RAW_CLIENT_ID = os.environ.get("OZON_CLIENT_ID", "")
 RAW_API_KEY = os.environ.get("OZON_API_KEY", "")
+PUSHPLUS_TOKEN = (os.environ.get("PUSHPLUS_TOKEN") or "").strip()
 
 CLIENT_ID = "".join([c for c in RAW_CLIENT_ID if ord(c) < 128]).strip()
 API_KEY = "".join([c for c in RAW_API_KEY if ord(c) < 128]).strip()
@@ -18,71 +19,122 @@ headers = {
     "Content-Type": "application/json"
 }
 
-def scan_raw_orders():
-    # 锁定后台明确有大量订单的 8 月进单区间
-    since = "2026-08-01T00:00:00Z"
-    to = "2026-08-28T23:59:59Z"
+def is_client_or_seller(initiator_str):
+    if not initiator_str:
+        return False
+    init = str(initiator_str).lower().strip()
+    if any(k in init for k in ["клиент", "покупатель", "client", "buyer", "买家"]):
+        return True
+    if any(k in init for k in ["продавец", "seller", "卖家"]):
+        return True
+    return False
+
+def scan_all_cancellations():
+    now = datetime.datetime.now(datetime.timezone.utc)
+    
+    # 覆盖从 8 月 1 日至今的所有数据（覆盖订单进单和 10 月实际取消的全周期）
+    since_str = "2026-08-01T00:00:00Z"
+    to_str = now.strftime("%Y-%m-%dT23:59:59Z")
 
     print("=" * 70)
-    print(f"【最简全量探测】查询区间: {since[:10]} 至 {to[:10]}")
+    print(f"【开始筛查】时间跨度: {since_str[:10]} 至 {to_str[:10]}")
+    print("【责任规则】取消过失方 (cancellation_initiator) 非买家 且 非卖家")
     print("=" * 70)
 
-    # 1. 先验证反查已知单号，确保通信与权限百分之百正常
-    sample_posting = "62662023-0335-1"
-    print(f"\n[第1步] 正在用 /v3/posting/fbs/get 确认单号 {sample_posting} ...")
-    r1 = requests.post(
-        f"{BASE_URL}/v3/posting/fbs/get",
-        headers=headers,
-        json={"posting_number": sample_posting, "with": {"analytics_data": True, "financial_data": True}},
-        timeout=30
-    )
-    if r1.status_code == 200:
-        res = r1.json().get("result", {})
-        print(f"  ✓ 成功读取单号: {res.get('posting_number')}")
-        print(f"  ✓ 真实状态 status: {res.get('status')}")
-        print(f"  ✓ cancellation 节点: {res.get('cancellation')}")
-    else:
-        print(f"  ✗ 单号反查失败: {r1.status_code}, {r1.text}")
+    offset = 0
+    limit = 50
+    matched_orders = []
+    total_scanned = 0
 
-    # 2. 测试跨境 realFBS 列表接口：不带 status 过滤
-    print(f"\n[第2步] 正在用 /v4/posting/fbs/list 拉取全量订单列表 (无状态限制)...")
-    payload = {
-        "dir": "DESC",
-        "filter": {
-            "since": since,
-            "to": to
-        },
-        "limit": 50,
-        "offset": 0
-    }
-    r2 = requests.post(f"{BASE_URL}/v4/posting/fbs/list", headers=headers, json=payload, timeout=30)
-    print(f"  - HTTP 响应码: {r2.status_code}")
-    data = r2.json()
-    postings = data.get("result", {}).get("postings", [])
-    print(f"  - 获取到订单数量: {len(postings)}")
+    while True:
+        payload = {
+            "dir": "DESC",
+            "filter": {
+                "since": since_str,
+                "to": to_str
+            },
+            "limit": limit,
+            "offset": offset,
+            "with": {
+                "financial_data": True
+            }
+        }
 
-    if not postings:
-        # 如果 /v4 确实对 crossborder 订单返回空，尝试 Ozon 跨境专用未完成列表
-        print(f"\n[第3步] 尝试请求 /v3/posting/fbs/unfulfilled/list (跨境常用未结接口)...")
-        r3 = requests.post(f"{BASE_URL}/v3/posting/fbs/unfulfilled/list", headers=headers, json={"dir": "DESC", "limit": 50, "offset": 0}, timeout=30)
-        print(f"  - HTTP 响应码: {r3.status_code}")
-        if r3.status_code == 200:
-            unf = r3.json().get("result", {}).get("postings", [])
-            print(f"  - 获取到订单数: {len(unf)}")
+        resp = requests.post(f"{BASE_URL}/v4/posting/fbs/list", headers=headers, json=payload, timeout=30)
+        if resp.status_code != 200:
+            print(f"API 请求失败: {resp.status_code}, {resp.text}")
+            break
 
-    # 3. 打印拿到的所有订单基本信息
-    if postings:
-        print("\n" + "=" * 70)
-        print(f"【成功拉取到 {len(postings)} 笔订单明细】:")
-        print("=" * 70)
-        for idx, item in enumerate(postings, 1):
-            canc = item.get("cancellation", {})
-            print(f"[{idx}] 货件号: {item.get('posting_number')} | 状态: {item.get('status')}")
-            if canc:
-                print(f"    - 取消过失方: {canc.get('cancellation_initiator')}")
-                print(f"    - 取消原因: {canc.get('cancel_reason')}")
+        data = resp.json()
+        postings = data.get("result", {}).get("postings", [])
+        if not postings:
+            break
+
+        total_scanned += len(postings)
+
+        for item in postings:
+            status = item.get("status")
+            cancellation = item.get("cancellation", {})
+
+            # 只要是已取消订单
+            if status == "cancelled" or cancellation:
+                initiator = cancellation.get("cancellation_initiator") or ""
+                
+                # 排除买家和卖家责任
+                if is_client_or_seller(initiator):
+                    continue
+
+                amount = sum(float(p.get("price", 0)) for p in item.get("products", []))
+                currency = item.get("products", [{}])[0].get("currency_code", "USD")
+
+                matched_orders.append({
+                    "posting_number": item.get("posting_number"),
+                    "initiator": initiator if initiator else "未标记责任方",
+                    "reason": cancellation.get("cancel_reason"),
+                    "reason_id": cancellation.get("cancel_reason_id"),
+                    "amount": f"{amount:.2f} {currency}",
+                    "tracking_number": item.get("tracking_number"),
+                    "in_process_at": item.get("in_process_at")
+                })
+
+        if not data.get("result", {}).get("has_next", False):
+            break
+        offset += limit
+
+    print(f"\n【扫描统计】共扫描 {total_scanned} 笔订单，发现 {len(matched_orders)} 笔非买/卖家责任的取消订单：\n")
+    for idx, o in enumerate(matched_orders, 1):
+        print(f"[{idx}] 货件号: {o['posting_number']}")
+        print(f"    - 取消过失方: {o['initiator']}")
+        print(f"    - 取消原因: {o['reason']} (ID: {o['reason_id']})")
+        print(f"    - 订单金额: {o['amount']} | 运单号: {o['tracking_number']}")
+        print(f"    - 下单时间: {o['in_process_at']}\n")
+
+    if PUSHPLUS_TOKEN and matched_orders:
+        push_lines = [f"### 【Ozon 索赔提醒】发现 {len(matched_orders)} 笔非买/卖家责任订单\n"]
+        for o in matched_orders:
+            push_lines.append(
+                f"- **货件号**: `{o['posting_number']}`\n"
+                f"  - 过失方: `{o['initiator']}`\n"
+                f"  - 原因: {o['reason']}\n"
+                f"  - 金额: {o['amount']}\n"
+                f"  - 运单号: `{o['tracking_number']}`\n"
+            )
+        try:
+            requests.post(
+                "http://www.pushplus.plus/send",
+                json={
+                    "token": PUSHPLUS_TOKEN,
+                    "title": f"【Ozon索赔】{len(matched_orders)} 笔责任取消订单待处理",
+                    "content": "\n".join(push_lines),
+                    "template": "markdown"
+                },
+                timeout=10
+            )
+            print("PushPlus 微信通知已发送！")
+        except Exception as e:
+            print(f"PushPlus 推送异常: {e}")
 
 if __name__ == "__main__":
     if not CLIENT_ID or not API_KEY:
         raise ValueError("请检查 OZON_CLIENT_ID 和 OZON_API_KEY！")
-    scan_raw_orders()
+    scan_all_cancellations()
