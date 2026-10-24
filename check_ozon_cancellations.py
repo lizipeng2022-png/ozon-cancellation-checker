@@ -19,7 +19,7 @@ headers = {
 }
 
 def print_all_cancelled_orders():
-    # 覆盖过去 150 天，确保覆盖 7月、8月、9月、10月的所有订单
+    # 覆盖过去 150 天，确保完全覆盖 7月、8月、9月、10月的订单
     now = datetime.datetime.now(datetime.timezone.utc)
     since = (now - datetime.timedelta(days=150)).strftime("%Y-%m-%dT00:00:00Z")
     to = now.strftime("%Y-%m-%dT23:59:59Z")
@@ -86,4 +86,22 @@ def print_all_cancelled_orders():
         initiators_set.add(str(initiator))
         reasons_set.add(f"{reason} (ID: {reason_id})")
 
-        print(f"[{idx}] 货件号: {item.get('posting_
+        print(f"[{idx}] 货件号: {item.get('posting_number')}")
+        print(f"    - 取消过失方 (cancellation_initiator): 【{initiator}】")
+        print(f"    - 取消原因 (cancel_reason): 【{reason}】 (ID: {reason_id})")
+        print(f"    - 原始 cancellation: {cancellation}")
+
+    print("\n" + "=" * 70)
+    print("【归纳总结：所有出现过的过失方 (Initiators)】:")
+    for init in initiators_set:
+        print(f"  * {init}")
+
+    print("\n【归纳总结：所有出现过的取消原因 (Cancel Reasons)】:")
+    for r in reasons_set:
+        print(f"  * {r}")
+    print("=" * 70)
+
+if __name__ == "__main__":
+    if not CLIENT_ID or not API_KEY:
+        raise ValueError("请检查 OZON_CLIENT_ID 和 OZON_API_KEY！")
+    print_all_cancelled_orders()
