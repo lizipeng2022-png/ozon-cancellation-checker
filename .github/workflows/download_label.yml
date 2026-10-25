@@ -1,0 +1,38 @@
+name: Generate and Download Package Label
+
+on:
+  workflow_dispatch:
+    inputs:
+      posting_number:
+        description: '请输入待导出面单的 Ozon 订单号 (货件号)'
+        required: true
+        default: '96080065-0159-1'
+
+jobs:
+  download-label:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'
+          cache: 'maven'
+
+      - name: Run Label Downloader
+        env:
+          OZON_CLIENT_ID: ${{ secrets.OZON_CLIENT_ID }}
+          OZON_API_KEY: ${{ secrets.OZON_API_KEY }}
+          POSTING_NUMBER: ${{ github.event.inputs.posting_number }}
+        run: |
+          mvn compile exec:java -Dexec.mainClass="com.ozon.OzonLabelDownloader"
+
+      - name: Upload Package Label PDF
+        uses: actions/upload-artifact@v4
+        with:
+          name: package-label-${{ github.event.inputs.posting_number }}
+          path: package_label_*.pdf
