@@ -4,11 +4,14 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 
+import java.io.BufferedWriter;
+import java.io.FileWriter;
 import java.io.IOException;
 import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.time.Duration;
 import java.time.Instant;
 import java.time.temporal.ChronoUnit;
@@ -19,7 +22,6 @@ public class OzonCancellationChecker {
     private static final String BASE_URL = "https://api-seller.ozon.ru";
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    // 仅保留 Ozon 核心凭据
     private static final String CLIENT_ID = sanitize(System.getenv("OZON_CLIENT_ID"));
     private static final String API_KEY = sanitize(System.getenv("OZON_API_KEY"));
 
@@ -203,6 +205,40 @@ public class OzonCancellationChecker {
             System.out.printf("    - 取消时间: %s (已取消 %d 天，处于 60~90 天索赔期)\n", o.cancelTime, o.daysSinceCancel);
             System.out.printf("    - 运单号: %s\n\n", o.trackingNumber);
         }
+
+        // 导出为 CSV 表格文件（自动添加 BOM 防止 Excel 打开乱码）
+        exportToCsv(matchedOrders.values(), "claimable_orders.csv");
+    }
+
+    private static void exportToCsv(Collection<OrderClaimInfo> orders, String fileName) {
+        try (BufferedWriter writer = new BufferedWriter(new FileWriter(fileName, StandardCharsets.UTF_8))) {
+            // 写入 UTF-8 BOM，确保 Excel 打开俄文和中文不乱码
+            writer.write("\uFEFF");
+
+            // 表头
+            writer.write("货件号,取消过失方,取消原因,原因ID,取消时间,已取消天数,运单号,进单时间\n");
+
+            for (OrderClaimInfo o : orders) {
+                writer.write(String.format("\"%s\",\"%s\",\"%s\",%d,\"%s\",%d,\"%s\",\"%s\"\n",
+                        escapeCsv(o.postingNumber),
+                        escapeCsv(o.initiator),
+                        escapeCsv(o.reason),
+                        o.reasonId,
+                        escapeCsv(o.cancelTime),
+                        o.daysSinceCancel,
+                        escapeCsv(o.trackingNumber),
+                        escapeCsv(o.inProcessAt)
+                ));
+            }
+            System.out.printf("✓ 表格已成功生成: %s (共 %d 行记录)\n", fileName, orders.size());
+        } catch (IOException e) {
+            System.err.println("导出 CSV 表格失败: " + e.getMessage());
+        }
+    }
+
+    private static String escapeCsv(String value) {
+        if (value == null) return "";
+        return value.replace("\"", "\"\"");
     }
 
     private record OrderClaimInfo(
