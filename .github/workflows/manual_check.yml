@@ -24,6 +24,14 @@ jobs:
         env:
           OZON_CLIENT_ID: ${{ secrets.OZON_CLIENT_ID }}
           OZON_API_KEY: ${{ secrets.OZON_API_KEY }}
-          PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
         run: |
           mvn clean compile exec:java -Dexec.mainClass="com.ozon.OzonCancellationChecker"
+
+      # 将生成的表格文件归档为下载产物
+      - name: Upload Claimable Orders CSV
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ozon-claimable-orders
+          path: claimable_orders.csv
+          if-no-files-found: ignore
