@@ -10,9 +10,11 @@ import java.net.URI;
 import java.net.http.HttpClient;
 import java.net.http.HttpRequest;
 import java.net.http.HttpResponse;
+import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardCopyOption;
+import java.nio.file.StandardOpenOption;
 import java.time.Duration;
 
 public class OzonLabelDownloader {
@@ -37,10 +39,7 @@ public class OzonLabelDownloader {
     }
 
     public static void main(String[] args) throws Exception {
-        // 优先从命令行参数读取订单号，没有则从环境变量 POSTING_NUMBER 获取
-        String postingNumber = (args.length > 0 && !args[0].isBlank()) 
-                ? args[0].trim() 
-                : System.getenv("POSTING_NUMBER");
+        String postingNumber = (args.length > 0 && !args[0].isBlank()) ? args[0].trim() : System.getenv("POSTING_NUMBER");
 
         if (postingNumber == null || postingNumber.isBlank()) {
             System.err.println("错误：请提供待打印面单的订单号（货件号）！");
@@ -56,7 +55,9 @@ public class OzonLabelDownloader {
         System.out.printf("正在为货件号 [%s] 申请生成面单...\n", postingNumber);
         System.out.println("=".repeat(70));
 
-        // 1. 发起生成面单任务
+        String outputFileName = String.format("package_label_%s.pdf", postingNumber);
+
+        // 1. 发起生成面单请求（使用 ofByteArray 接收以同时兼容二进制 PDF 与 JSON 文本）
         ObjectNode createBody = MAPPER.createObjectNode();
         ArrayNode numbersArray = createBody.putArray("posting_number");
         numbersArray.add(postingNumber);
@@ -70,29 +71,47 @@ public class OzonLabelDownloader {
                 .POST(HttpRequest.BodyPublishers.ofString(createBody.toString()))
                 .build();
 
-        HttpResponse<String> createResp = HTTP_CLIENT.send(createReq, HttpResponse.BodyHandlers.ofString());
+        HttpResponse<byte[]> createResp = HTTP_CLIENT.send(createReq, HttpResponse.BodyHandlers.ofByteArray());
+
         if (createResp.statusCode() != 200) {
-            System.err.printf("创建面单生成任务失败 (%d): %s\n", createResp.statusCode(), createResp.body());
+            String errBody = new String(createResp.body(), StandardCharsets.UTF_8);
+            System.err.printf("创建面单生成任务失败 (%d): %s\n", createResp.statusCode(), errBody);
             System.exit(1);
         }
 
-        JsonNode createRoot = MAPPER.readTree(createResp.body());
+        byte[] respBytes = createResp.body();
+        String contentType = createResp.headers().firstValue("Content-Type").orElse("");
+
+        // 检查返回是否为 PDF 二进制文件（%PDF 开头或者 Content-Type 包含 pdf）
+        boolean isPdf = contentType.toLowerCase().contains("application/pdf")
+                || (respBytes.length >= 4 && respBytes[0] == '%' && respBytes[1] == 'P' && respBytes[2] == 'D' && respBytes[3] == 'F');
+
+        if (isPdf) {
+            System.out.println("✓ 接口已直接同步返回 PDF 面单文件！");
+            Files.write(Path.of(outputFileName), respBytes, StandardOpenOption.CREATE, StandardOpenOption.TRUNCATE_EXISTING);
+            System.out.printf("✓ 面单已成功保存至本地: %s\n", outputFileName);
+            return;
+        }
+
+        // 2. 如果不是直接返回 PDF，按异步任务 JSON 解析
+        String respText = new String(respBytes, StandardCharsets.UTF_8);
+        JsonNode createRoot = MAPPER.readTree(respText);
         long taskId = createRoot.path("result").path("task_id").asLong();
+
         if (taskId == 0) {
-            System.err.println("未获取到有效的 task_id: " + createResp.body());
+            System.err.println("未获取到有效的 task_id: " + respText);
             System.exit(1);
         }
 
         System.out.printf("✓ 面单任务已提交，Task ID: %d，正在等待官方渲染完成...\n", taskId);
 
-        // 2. 轮询面单生成状态
+        // 3. 轮询面单生成状态
         String pdfUrl = null;
         ObjectNode statusBody = MAPPER.createObjectNode();
         statusBody.put("task_id", taskId);
 
         for (int i = 1; i <= 15; i++) {
             Thread.sleep(2000);
-
             HttpRequest statusReq = HttpRequest.newBuilder()
                     .uri(URI.create(BASE_URL + "/v1/posting/fbs/package-label/status"))
                     .header("Client-Id", CLIENT_ID)
@@ -106,7 +125,6 @@ public class OzonLabelDownloader {
                 JsonNode statusRoot = MAPPER.readTree(statusResp.body());
                 JsonNode result = statusRoot.path("result");
                 String status = result.path("status").asText();
-
                 System.out.printf("  - 检查状态 (%d/15): %s\n", i, status);
 
                 if ("completed".equalsIgnoreCase(status)) {
@@ -126,14 +144,14 @@ public class OzonLabelDownloader {
 
         System.out.println("✓ 面单生成成功！下载链接: " + pdfUrl);
 
-        // 3. 下载 PDF 到本地磁盘
-        String outputFileName = String.format("package_label_%s.pdf", postingNumber);
+        // 4. 下载 PDF 到本地磁盘
         HttpRequest downloadReq = HttpRequest.newBuilder()
                 .uri(URI.create(pdfUrl))
                 .GET()
                 .build();
 
         HttpResponse<InputStream> downloadResp = HTTP_CLIENT.send(downloadReq, HttpResponse.BodyHandlers.ofInputStream());
+
         if (downloadResp.statusCode() == 200) {
             try (InputStream in = downloadResp.body()) {
                 Files.copy(in, Path.of(outputFileName), StandardCopyOption.REPLACE_EXISTING);
@@ -141,6 +159,7 @@ public class OzonLabelDownloader {
             System.out.printf("✓ 面单已成功下载保存至本地: %s\n", outputFileName);
         } else {
             System.err.printf("下载 PDF 失败，HTTP 状态码: %d\n", downloadResp.statusCode());
+            System.exit(1);
         }
     }
 }
