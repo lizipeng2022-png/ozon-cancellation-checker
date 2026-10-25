@@ -19,9 +19,9 @@ public class OzonCancellationChecker {
     private static final String BASE_URL = "https://api-seller.ozon.ru";
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
+    // 仅保留 Ozon 核心凭据
     private static final String CLIENT_ID = sanitize(System.getenv("OZON_CLIENT_ID"));
     private static final String API_KEY = sanitize(System.getenv("OZON_API_KEY"));
-    private static final String PUSHPLUS_TOKEN = System.getenv("PUSHPLUS_TOKEN") != null ? System.getenv("PUSHPLUS_TOKEN").trim() : "";
 
     private static final HttpClient HTTP_CLIENT = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(30))
@@ -161,6 +161,7 @@ public class OzonCancellationChecker {
                     Instant cancelDt = parseIsoInstant(cancelTimeRaw);
                     long daysSinceCancel = cancelDt != null ? ChronoUnit.DAYS.between(cancelDt, now) : -1;
 
+                    // 60 <= 取消天数 <= 90
                     if (daysSinceCancel < 60 || daysSinceCancel > 90) {
                         continue;
                     }
@@ -201,44 +202,6 @@ public class OzonCancellationChecker {
             System.out.printf("    - 取消原因: 【%s】 (ID: %d)\n", o.reason, o.reasonId);
             System.out.printf("    - 取消时间: %s (已取消 %d 天，处于 60~90 天索赔期)\n", o.cancelTime, o.daysSinceCancel);
             System.out.printf("    - 运单号: %s\n\n", o.trackingNumber);
-        }
-
-        if (!PUSHPLUS_TOKEN.isEmpty() && !matchedOrders.isEmpty()) {
-            sendPushPlus(matchedOrders.values());
-        }
-    }
-
-    private static void sendPushPlus(Collection<OrderClaimInfo> orders) {
-        StringBuilder sb = new StringBuilder();
-        sb.append(String.format("### 【Ozon 60~90天索赔黄金期订单】共 %d 笔\n\n", orders.size()));
-        sb.append("> 筛选条件：已取消满 60 天且在 90 天索赔有效期内 + 物流/官方责任\n\n");
-
-        int count = 0;
-        for (OrderClaimInfo o : orders) {
-            if (++count > 30) break;
-            sb.append(String.format("- **货件号**: `%s`\n", o.postingNumber));
-            sb.append(String.format("  - 过失方: `%s` | 已取消: `%d天`\n", o.initiator, o.daysSinceCancel));
-            sb.append(String.format("  - 原因: %s\n", o.reason));
-            sb.append(String.format("  - 运单号: `%s`\n", o.trackingNumber));
-        }
-
-        try {
-            ObjectNode pushJson = MAPPER.createObjectNode();
-            pushJson.put("token", PUSHPLUS_TOKEN);
-            pushJson.put("title", String.format("【Ozon索赔】%d 笔订单已满60天待索赔", orders.size()));
-            pushJson.put("content", sb.toString());
-            pushJson.put("template", "markdown");
-
-            HttpRequest req = HttpRequest.newBuilder()
-                    .uri(URI.create("http://www.pushplus.plus/send"))
-                    .header("Content-Type", "application/json")
-                    .POST(HttpRequest.BodyPublishers.ofString(pushJson.toString()))
-                    .build();
-
-            HTTP_CLIENT.send(req, HttpResponse.BodyHandlers.ofString());
-            System.out.println("✓ PushPlus 微信通知已成功推送！");
-        } catch (Exception e) {
-            System.out.println("PushPlus 推送异常: " + e.getMessage());
         }
     }
 
